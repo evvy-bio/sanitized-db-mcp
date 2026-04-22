@@ -198,6 +198,7 @@ tables:
       deleted: {type: boolean, placeholder: "false"}
       deleted_at: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
       expiration_date: {type: date, placeholder: "'1900-01-01'"}
+      id: {type: serial, placeholder: "0"}
       modify_date: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
       needs_subscription_cancellation: {type: boolean, placeholder: "false"}
       num_allowed_refills: {type: integer, placeholder: "0"}
@@ -328,6 +329,7 @@ tables:
       diagnosis_text: {type: varchar, placeholder: "'[REDACTED]'"}
       error_details: {type: text, placeholder: "'[REDACTED]'"}
       error_reason: {type: varchar, placeholder: "'[REDACTED]'"}
+      id: {type: serial, placeholder: "0"}
       ineligible_reason: {type: varchar, placeholder: "'[REDACTED]'"}
       manual_clinician_note: {type: text, placeholder: "'[REDACTED]'"}
       manual_diagnoses_codes: {type: varchar, placeholder: "'[REDACTED]'"}
@@ -499,6 +501,7 @@ tables:
       checkout_source: {type: varchar, placeholder: "'[REDACTED]'"}
       checkout_token: {type: varchar, placeholder: "'[REDACTED]'"}
       create_date: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
+      id: {type: serial, placeholder: "0"}
       is_manual_invoice: {type: boolean, placeholder: "false"}
       is_subscription_order: {type: boolean, placeholder: "false"}
       is_testing_order: {type: boolean, placeholder: "false"}
@@ -539,6 +542,7 @@ tables:
       ecomm_product_id: {type: integer, placeholder: "0"}
       gift_card_code: {type: varchar, placeholder: "'[REDACTED]'"}
       gift_card_id: {type: varchar, placeholder: "'[REDACTED]'"}
+      id: {type: serial, placeholder: "0"}
       is_bulk_order: {type: boolean, placeholder: "false"}
       is_recurring_order_item: {type: boolean, placeholder: "false"}
       is_subscription: {type: boolean, placeholder: "false"}
@@ -1023,6 +1027,7 @@ tables:
       deactivated_at: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
       ecomm_order_id: {type: integer, placeholder: "0"}
       hash: {type: varchar, placeholder: "'[REDACTED]'"}
+      id: {type: serial, placeholder: "0"}
       lab: {type: varchar, placeholder: "'[REDACTED]'"}
       lab_accession_id: {type: varchar, placeholder: "'[REDACTED]'"}
       modify_date: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
@@ -1044,6 +1049,7 @@ tables:
       create_date: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
       file: {type: varchar, placeholder: "'[REDACTED]'"}
       has_postmenopausal_atrophy: {type: boolean, placeholder: "false"}
+      id: {type: serial, placeholder: "0"}
       ineligible_for_care: {type: boolean, placeholder: "false"}
       infection_state_id: {type: integer, placeholder: "0"}
       lab: {type: varchar, placeholder: "'[REDACTED]'"}
@@ -1120,6 +1126,7 @@ tables:
       deactivated_at: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
       ecomm_order_id: {type: integer, placeholder: "0"}
       hash: {type: varchar, placeholder: "'[REDACTED]'"}
+      id: {type: serial, placeholder: "0"}
       lab: {type: varchar, placeholder: "'[REDACTED]'"}
       lab_accession_id: {type: varchar, placeholder: "'[REDACTED]'"}
       modify_date: {type: timestamp, placeholder: "'1900-01-01T00:00:00Z'"}
