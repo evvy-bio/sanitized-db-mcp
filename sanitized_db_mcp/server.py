@@ -30,10 +30,16 @@ import os
 import sys
 import time
 
-from mcp.server import Server
-from mcp.server.lowlevel.server import request_ctx
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+)
 
 from .allowlist import Allowlist
 from .audit import AuditEntry, extract_client_ip, log_query
@@ -89,81 +95,80 @@ def create_server() -> tuple[Server, Allowlist]:
         len(allowlist.allowed_functions),
     )
 
-    server = Server(os.environ.get("MCP_SERVER_NAME", "sanitized-db"))
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return [
-            Tool(
-                name="query",
-                description=(
-                    "Execute a read-only SQL query against the database. "
-                    "PII/PHI columns are automatically redacted with type-preserving "
-                    "placeholders. Only SELECT statements are allowed. "
-                    "Returns results as a JSON array of row objects."
-                ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "sql": {
-                            "type": "string",
-                            "description": "The SQL SELECT query to execute",
-                        }
+    async def list_tools(
+        ctx: ServerRequestContext, params: PaginatedRequestParams | None
+    ) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name="query",
+                    description=(
+                        "Execute a read-only SQL query against the database. "
+                        "PII/PHI columns are automatically redacted with type-preserving "
+                        "placeholders. Only SELECT statements are allowed. "
+                        "Returns results as a JSON array of row objects."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "sql": {
+                                "type": "string",
+                                "description": "The SQL SELECT query to execute",
+                            }
+                        },
+                        "required": ["sql"],
                     },
-                    "required": ["sql"],
-                },
-            ),
-            Tool(
-                name="describe_schema",
-                description=(
-                    "List the tables and columns this server will let you query. "
-                    "Call this before writing SQL: system catalogs such as "
-                    "information_schema are blocked, so this is the only way to "
-                    "discover what exists. Omit 'table' for all table names; pass a "
-                    "table name for its queryable columns and their types. Supports a "
-                    "trailing * wildcard, for example 'consults_*'."
                 ),
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "table": {
-                            "type": "string",
-                            "description": (
-                                "Optional table name or prefix pattern. "
-                                "Omit for the full table list."
-                            ),
-                        }
+                Tool(
+                    name="describe_schema",
+                    description=(
+                        "List the tables and columns this server will let you query. "
+                        "Call this before writing SQL: system catalogs such as "
+                        "information_schema are blocked, so this is the only way to "
+                        "discover what exists. Omit 'table' for all table names; pass a "
+                        "table name for its queryable columns and their types. Supports a "
+                        "trailing * wildcard, for example 'consults_*'."
+                    ),
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "table": {
+                                "type": "string",
+                                "description": (
+                                    "Optional table name or prefix pattern. "
+                                    "Omit for the full table list."
+                                ),
+                            }
+                        },
                     },
-                },
-            ),
-        ]
+                ),
+            ]
+        )
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        if name == "describe_schema":
-            table = str(arguments.get("table") or "").strip()
-            return [TextContent(type="text", text=allowlist.describe(table))]
+    async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult:
+        if params.name == "describe_schema":
+            table = str((params.arguments or {}).get("table") or "").strip()
+            return CallToolResult(
+                content=[TextContent(type="text", text=allowlist.describe(table))]
+            )
 
-        if name != "query":
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        if params.name != "query":
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Unknown tool: {params.name}")]
+            )
 
-        sql = arguments.get("sql", "").strip()
+        sql = (params.arguments or {}).get("sql", "").strip()
         if not sql:
-            return [TextContent(type="text", text="Error: empty SQL query")]
+            return CallToolResult(content=[TextContent(type="text", text="Error: empty SQL query")])
 
         audit = AuditEntry(original_sql=sql)
 
-        # Enrich audit with client identity from MCP request context
-        try:
-            ctx = request_ctx.get()
-        except LookupError:
-            pass
-        else:
-            audit.request_id = str(ctx.request_id) if ctx.request_id else None
-            if ctx.request is not None and hasattr(ctx.request, "headers"):
-                audit.client_ip = extract_client_ip(ctx.request)
-                audit.user_agent = ctx.request.headers.get("user-agent")
-                audit.session_id = getattr(ctx.request, "query_params", {}).get("session_id")
+        # Enrich audit with client identity; ctx.request is the HTTP request on SSE, None on stdio.
+        audit.request_id = str(ctx.request_id) if ctx.request_id else None
+        if ctx.request is not None and hasattr(ctx.request, "headers"):
+            audit.client_ip = extract_client_ip(ctx.request)
+            audit.user_agent = ctx.request.headers.get("user-agent")
+            audit.session_id = getattr(ctx.request, "query_params", {}).get("session_id")
 
         audit.transport = _transport_mode
 
@@ -197,24 +202,36 @@ def create_server() -> tuple[Server, Allowlist]:
                 header_parts.append(f"{len(result.columns_redacted)} columns redacted")
             header = " | ".join(header_parts)
 
-            return [TextContent(type="text", text=f"/* {header} */\n{response}")]
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"/* {header} */\n{response}")]
+            )
 
         except SanitizationError as e:
             e.log()
             audit.outcome = "blocked"
             audit.rejection_reason = e.agent_message
             audit.execution_time_ms = (time.time() - start) * 1000
-            return [TextContent(type="text", text=f"Error: {e.agent_message}")]
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: {e.agent_message}")]
+            )
 
         except Exception as e:
             logger.error("Unexpected error: %s", e, exc_info=True)
             audit.outcome = "error"
             audit.rejection_reason = sanitize_pg_error(e)
             audit.execution_time_ms = (time.time() - start) * 1000
-            return [TextContent(type="text", text=f"Error: {sanitize_pg_error(e)}")]
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: {sanitize_pg_error(e)}")]
+            )
 
         finally:
             log_query(audit)
+
+    server = Server(
+        os.environ.get("MCP_SERVER_NAME", "sanitized-db"),
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
 
     return server, allowlist
 
