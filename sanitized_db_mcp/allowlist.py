@@ -94,3 +94,48 @@ class Allowlist:
     @property
     def allowed_functions(self) -> set[str]:
         return self._allowed_functions
+
+    def describe(self, pattern: str = "") -> str:
+        """Render the allowlist as an agent-facing schema reference.
+
+        This allowlist is already the server's source of truth for what is
+        queryable, so serving it removes any need for callers to keep a copy in
+        sync. Without it an agent cannot discover table names at all: system
+        catalogs are blocked, and a nonexistent table returns the same error as a
+        restricted one, so a rejection never says which it was.
+
+        Omit ``pattern`` for every table name. Pass a table name for its columns,
+        or a ``prefix*`` pattern to narrow the list.
+        """
+        tables = sorted(self.all_tables)
+
+        if not pattern:
+            listing = "\n".join(tables)
+            return (
+                f"/* {len(tables)} queryable tables. "
+                "Call describe_schema with a table name for its columns. */\n"
+                f"{listing}"
+            )
+
+        prefix = pattern.strip().lower().rstrip("*")
+        if pattern.endswith("*") or prefix not in self.all_tables:
+            matches = [t for t in tables if t.startswith(prefix)]
+            if not matches:
+                return (
+                    f"Error: no queryable table matches {pattern!r}. "
+                    "Call describe_schema with no arguments for the full list."
+                )
+            if len(matches) > 1 or pattern.endswith("*"):
+                listing = "\n".join(matches)
+                return f"/* {len(matches)} tables matching {pattern!r} */\n{listing}"
+            prefix = matches[0]
+
+        columns = sorted(self.get_visible_columns(prefix))
+        lines = [f"{name}: {self.get_placeholder(prefix, name)}" for name in columns]
+        rendered = "\n".join(lines)
+        return (
+            f"/* {prefix}: {len(columns)} queryable columns. "
+            "Each line shows the placeholder substituted when a value is redacted. "
+            "Columns absent from this list cannot be referenced in SQL. */\n"
+            f"{rendered}"
+        )

@@ -112,11 +112,38 @@ def create_server() -> tuple[Server, Allowlist]:
                     },
                     "required": ["sql"],
                 },
-            )
+            ),
+            Tool(
+                name="describe_schema",
+                description=(
+                    "List the tables and columns this server will let you query. "
+                    "Call this before writing SQL: system catalogs such as "
+                    "information_schema are blocked, so this is the only way to "
+                    "discover what exists. Omit 'table' for all table names; pass a "
+                    "table name for its queryable columns and their types. Supports a "
+                    "trailing * wildcard, for example 'consults_*'."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "table": {
+                            "type": "string",
+                            "description": (
+                                "Optional table name or prefix pattern. "
+                                "Omit for the full table list."
+                            ),
+                        }
+                    },
+                },
+            ),
         ]
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+        if name == "describe_schema":
+            table = str(arguments.get("table") or "").strip()
+            return [TextContent(type="text", text=allowlist.describe(table))]
+
         if name != "query":
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -136,9 +163,7 @@ def create_server() -> tuple[Server, Allowlist]:
             if ctx.request is not None and hasattr(ctx.request, "headers"):
                 audit.client_ip = extract_client_ip(ctx.request)
                 audit.user_agent = ctx.request.headers.get("user-agent")
-                audit.session_id = getattr(
-                    ctx.request, "query_params", {}
-                ).get("session_id")
+                audit.session_id = getattr(ctx.request, "query_params", {}).get("session_id")
 
         audit.transport = _transport_mode
 
@@ -209,8 +234,7 @@ def _run_sse(server: Server) -> None:
         import uvicorn
     except ImportError:
         raise ImportError(
-            "SSE transport requires uvicorn. "
-            "Install with: pip install 'sanitized-db-mcp[sse]'"
+            "SSE transport requires uvicorn. Install with: pip install 'sanitized-db-mcp[sse]'"
         ) from None
 
     port = _parse_positive_int_env("PORT", default="8000")
@@ -262,9 +286,7 @@ def main() -> None:
     elif transport == "sse":
         _run_sse(server)
     else:
-        raise ConfigurationError(
-            f"Unknown MCP_TRANSPORT: {transport!r}. Valid options: stdio, sse"
-        )
+        raise ConfigurationError(f"Unknown MCP_TRANSPORT: {transport!r}. Valid options: stdio, sse")
 
 
 if __name__ == "__main__":
