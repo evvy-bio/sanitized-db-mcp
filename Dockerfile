@@ -5,7 +5,7 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir --upgrade "pip>=26.2.2"
 
 COPY pyproject.toml README.md ./
 COPY sanitized_db_mcp/ sanitized_db_mcp/
@@ -13,6 +13,11 @@ COPY sanitized_db_mcp/ sanitized_db_mcp/
 RUN pip install --no-cache-dir '.[sse]'
 
 FROM python:3.12-slim
+
+# Refresh the CA store: the cached base image can predate the eMudhra distrust.
+RUN apt-get update \
+ && apt-get install -y --only-upgrade ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
