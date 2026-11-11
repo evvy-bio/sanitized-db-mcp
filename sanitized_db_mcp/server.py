@@ -3,17 +3,15 @@
 Sanitizing MCP server for PII/PHI-safe database queries.
 
 This server receives SQL queries from LLM agents, rewrites them using
-pglast to replace non-allowlisted column references with type-preserving
-placeholders, then executes the rewritten SQL against the database.
+pglast to verify relation and column sources, then executes the rewritten
+SQL against the database.
 
 Usage:
     python -m sanitized_db_mcp.server
 
 Environment variables:
     ALLOWLIST_PATH      Path to allowlist.yaml (required)
-    RENDER_POSTGRES_ID  Render Postgres instance ID (optional)
-    RENDER_API_KEY      Render API key (optional)
-    DATABASE_URL        Static connection string fallback (optional)
+    DATABASE_URL        PostgreSQL connection string for agent_readonly (required)
     MCP_TRANSPORT       Transport mode: stdio (default) or sse
     PORT                HTTP port for SSE server (default 8000)
     MCP_API_KEY         Bearer token for SSE authentication (recommended)
@@ -24,6 +22,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+from functools import partial
 import json
 import logging
 import os
@@ -43,7 +42,7 @@ from mcp.types import (
 
 from .allowlist import Allowlist
 from .audit import AuditEntry, extract_client_ip, log_query
-from .connection import execute_query
+from .connection import execute_query, verify_database_access
 from .errors import ConfigurationError, SanitizationError, sanitize_pg_error
 from .sanitizer import sanitize_query
 
@@ -104,8 +103,9 @@ def create_server() -> tuple[Server, Allowlist]:
                     name="query",
                     description=(
                         "Execute a read-only SQL query against the database. "
-                        "PII/PHI columns are automatically redacted with type-preserving "
-                        "placeholders. Only SELECT statements are allowed. "
+                        "Use approved relations and qualify columns in joins. "
+                        "Restricted columns in outer projections may be redacted. "
+                        "Only SELECT statements are allowed. "
                         "Returns results as a JSON array of row objects."
                     ),
                     inputSchema={
@@ -189,7 +189,7 @@ def create_server() -> tuple[Server, Allowlist]:
                 audit.outcome = "allowed"
 
             # Execute
-            rows = execute_query(result.rewritten_sql)
+            rows = execute_query(result.rewritten_sql, allowlist=allowlist)
             audit.row_count = len(rows)
             audit.execution_time_ms = (time.time() - start) * 1000
 
@@ -236,14 +236,15 @@ def create_server() -> tuple[Server, Allowlist]:
     return server, allowlist
 
 
-async def _run_stdio(server: Server) -> None:
+async def _run_stdio(server: Server, allowlist: Allowlist) -> None:
     """Run the server with stdio transport."""
+    await asyncio.to_thread(verify_database_access, allowlist)
     init_options = server.create_initialization_options()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, init_options)
 
 
-def _run_sse(server: Server) -> None:
+def _run_sse(server: Server, allowlist: Allowlist) -> None:
     """Run the server with SSE transport over HTTP."""
     from .transport import create_sse_app
 
@@ -273,7 +274,12 @@ def _run_sse(server: Server) -> None:
     max_connections = _parse_positive_int_env("MCP_MAX_CONNECTIONS")
     session_timeout = _parse_positive_int_env("MCP_SESSION_TIMEOUT")
 
-    app = create_sse_app(server, api_key=api_key, session_timeout=session_timeout)
+    app = create_sse_app(
+        server,
+        check_database=partial(verify_database_access, allowlist),
+        api_key=api_key,
+        session_timeout=session_timeout,
+    )
 
     global _transport_mode
     _transport_mode = "sse"
@@ -296,12 +302,12 @@ def main() -> None:
     """
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower().strip()
 
-    server, _allowlist = create_server()
+    server, allowlist = create_server()
 
     if transport == "stdio":
-        asyncio.run(_run_stdio(server))
+        asyncio.run(_run_stdio(server, allowlist))
     elif transport == "sse":
-        _run_sse(server)
+        _run_sse(server, allowlist)
     else:
         raise ConfigurationError(f"Unknown MCP_TRANSPORT: {transport!r}. Valid options: stdio, sse")
 

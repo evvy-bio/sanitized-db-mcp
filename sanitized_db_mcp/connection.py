@@ -1,127 +1,135 @@
-"""
-Dual-mode database connection management.
-
-Supports:
-  1. Render API: dynamically resolves connection string from Render
-  2. Static DATABASE_URL: for local Docker or future AWS migration
-"""
+"""PostgreSQL access for the query service."""
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 import logging
 import os
-import time
 
-import httpx
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 
+from .allowlist import Allowlist
 from .errors import ConfigurationError, QueryExecutionError, QueryTimeoutError
 
 
 logger = logging.getLogger(__name__)
+DATABASE_ROLE = "agent_readonly"
 
-# Cache Render API connection string for 5 minutes
-_RENDER_CACHE_TTL = 300
-_render_cache: dict[str, tuple[str, float]] = {}
+_ROLE_QUERY = """
+SELECT session_user, current_user,
+       rolsuper OR rolcreaterole OR rolcreatedb OR rolreplication OR rolbypassrls
+FROM pg_catalog.pg_roles
+WHERE rolname = current_user
+"""
 
-
-def _fetch_render_connection_string(postgres_id: str, api_key: str) -> str:
-    """Resolve a connection string from the Render API."""
-    cache_key = postgres_id
-    now = time.time()
-
-    # Check cache
-    if cache_key in _render_cache:
-        cached_url, cached_at = _render_cache[cache_key]
-        if now - cached_at < _RENDER_CACHE_TTL:
-            return cached_url
-
-    url = f"https://api.render.com/v1/postgres/{postgres_id}/connection-info"
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    try:
-        resp = httpx.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        conn_string = data.get("externalConnectionString", "")
-        if not conn_string:
-            raise ConfigurationError(f"Render API returned no connection string for {postgres_id}")
-
-        # Cache it
-        _render_cache[cache_key] = (conn_string, now)
-        logger.info("Fetched connection string from Render API (cached for %ds)", _RENDER_CACHE_TTL)
-        return conn_string
-
-    except httpx.HTTPStatusError as e:
-        raise ConfigurationError(
-            f"Render API returned {e.response.status_code} for postgres {postgres_id}"
-        )
-    except httpx.RequestError as e:
-        raise ConfigurationError(f"Render API request failed: {e}")
+# Ask PostgreSQL for effective SELECT privileges, including table-wide,
+# inherited and PUBLIC grants. The system catalog schemas serve metadata.
+_READ_GRANTS_QUERY = """
+SELECT namespace.nspname, relation.relname, attribute.attname
+FROM pg_catalog.pg_class AS relation
+JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+LEFT JOIN pg_catalog.pg_attribute AS attribute
+    ON attribute.attrelid = relation.oid
+    AND attribute.attnum <> 0
+    AND NOT attribute.attisdropped
+WHERE relation.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+    AND namespace.nspname NOT IN ('pg_catalog', 'information_schema')
+    AND namespace.nspname !~ '^pg_(temp|toast)(_|$)'
+    AND CASE
+        WHEN relation.relkind = 'S' THEN
+            pg_catalog.has_sequence_privilege(relation.oid, 'SELECT')
+        WHEN attribute.attnum IS NULL THEN
+            pg_catalog.has_table_privilege(relation.oid, 'SELECT')
+        ELSE
+            pg_catalog.has_column_privilege(relation.oid, attribute.attnum, 'SELECT')
+    END
+"""
 
 
 def get_connection_string() -> str:
-    """Resolve the database connection string.
-
-    Prefers Render API when configured, falls back to DATABASE_URL.
-    """
-    render_postgres_id = os.environ.get("RENDER_POSTGRES_ID")
-    render_api_key = os.environ.get("RENDER_API_KEY")
+    """Require an explicit DSN for the query service."""
+    if os.environ.get("RENDER_POSTGRES_ID") and os.environ.get("RENDER_API_KEY"):
+        raise ConfigurationError(
+            "Remove Render database discovery settings and configure DATABASE_URL"
+        )
     database_url = os.environ.get("DATABASE_URL")
-
-    if render_postgres_id and render_api_key:
-        return _fetch_render_connection_string(render_postgres_id, render_api_key)
-
-    if database_url:
-        return database_url
-
-    raise ConfigurationError(
-        "No database connection configured. "
-        "Set RENDER_POSTGRES_ID + RENDER_API_KEY, or DATABASE_URL."
-    )
+    if not database_url:
+        raise ConfigurationError("DATABASE_URL is required for the query service")
+    return database_url
 
 
-def execute_query(sql: str, connection_string: str | None = None) -> list[dict]:
-    """Execute a read-only SQL query and return rows as dicts.
-
-    Enforces:
-      - Read-only transaction
-      - 5-second statement timeout
-      - SSL required (when not localhost)
-    """
+@contextmanager
+def _verified_connection(
+    allowlist: Allowlist, connection_string: str | None
+) -> Iterator[psycopg.Connection]:
     if connection_string is None:
         connection_string = get_connection_string()
-
-    # Determine if we need SSL (not for localhost)
-    use_ssl = "localhost" not in connection_string and "127.0.0.1" not in connection_string
-
     try:
-        conn_params = {"autocommit": True}
-        if use_ssl:
-            conn_params["sslmode"] = "require"
+        settings = conninfo_to_dict(connection_string)
+    except psycopg.Error:
+        raise ConfigurationError("Invalid DATABASE_URL") from None
+    if settings.get("user") != DATABASE_ROLE:
+        raise ConfigurationError(f"DATABASE_URL must specify the {DATABASE_ROLE} login")
 
-        with psycopg.connect(connection_string, **conn_params) as conn:
-            conn.execute("SET statement_timeout = '5s'")
-            conn.execute("SET default_transaction_read_only = 'on'")
+    hosts = (settings.get("hostaddr") or settings.get("host", "")).split(",")
+    connection_options = {"autocommit": True, "connect_timeout": 5}
+    if any(host not in {"localhost", "127.0.0.1", "::1"} for host in hosts):
+        if settings.get("sslmode") not in {"verify-ca", "verify-full"}:
+            connection_options["sslmode"] = "require"
 
-            with conn.cursor() as cur:
-                cur.execute(sql)
+    with psycopg.connect(connection_string, **connection_options) as conn:
+        conn.read_only = True
+        with conn.transaction():
+            conn.execute("SET LOCAL statement_timeout = '5s'")
+            conn.execute("SET LOCAL search_path = pg_catalog, public, pg_temp")
 
-                if cur.description is None:
-                    return []
+            if conn.execute(_ROLE_QUERY).fetchone() != (DATABASE_ROLE, DATABASE_ROLE, False):
+                raise ConfigurationError(
+                    f"Database session must use the dedicated {DATABASE_ROLE} login"
+                )
 
-                columns = [desc.name for desc in cur.description]
-                rows = cur.fetchall()
+            readable = set(conn.execute(_READ_GRANTS_QUERY).fetchall())
+            if readable - allowlist.database_columns():
+                raise ConfigurationError("Database SELECT grants exceed the approved allowlist")
 
-                return [dict(zip(columns, row, strict=True)) for row in rows]
+            yield conn
+
+
+def verify_database_access(
+    allowlist: Allowlist, connection_string: str | None = None
+) -> None:
+    """Check the configured login and read grants without issuing a tool query."""
+    try:
+        with _verified_connection(allowlist, connection_string):
+            pass
+    except psycopg.Error as error:
+        raise ConfigurationError(
+            f"Database access could not be verified ({type(error).__name__})"
+        ) from None
+
+
+def execute_query(
+    sql: str, connection_string: str | None = None, *, allowlist: Allowlist
+) -> list[dict]:
+    """Execute sanitized SQL on the same read-only connection that passed the grant check."""
+    try:
+        with _verified_connection(allowlist, connection_string) as conn, conn.cursor() as cur:
+            cur.execute(sql)
+
+            if cur.description is None:
+                return []
+
+            columns = [desc.name for desc in cur.description]
+            return [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
     except psycopg.errors.QueryCanceled:
-        raise QueryTimeoutError("Query exceeded 5-second timeout")
+        raise QueryTimeoutError("Query exceeded 5-second timeout") from None
     except psycopg.errors.ReadOnlySqlTransaction:
-        raise QueryExecutionError("Write operations are not permitted")
+        raise QueryExecutionError("Write operations are not permitted") from None
     except psycopg.errors.InsufficientPrivilege:
-        raise QueryExecutionError("Insufficient privileges for this query")
-    except psycopg.Error as e:
-        # Log the full error server-side, return sanitized message
-        logger.error("Database error: %s", e)
-        raise QueryExecutionError(f"Database error: {type(e).__name__}")
+        raise QueryExecutionError("Insufficient privileges for this query") from None
+    except psycopg.Error as error:
+        logger.error("Database error: %s", type(error).__name__)
+        raise QueryExecutionError(f"Database error: {type(error).__name__}") from None

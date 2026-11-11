@@ -8,7 +8,7 @@ An MCP server that rewrites SQL queries at the AST level to prevent PII/PHI expo
 
 ## Why This Exists
 
-AI agents write SQL. They also hallucinate column names, ignore access controls, and cheerfully SELECT * from tables full of personal data. This server sits between the agent and your PostgreSQL database, rewriting every query so hidden columns return type-preserving placeholders instead of real values. The agent gets useful results; your users keep their privacy.
+The server checks every SQL query scope against an allowlist of relations and columns. It can replace restricted outer projection values with a redaction marker and rejects queries with unresolved column sources.
 
 ## Quick Start
 
@@ -41,7 +41,7 @@ Pick one of the four methods below and add the config to your `.mcp.json`.
     "args": ["sanitized-db-mcp"],
     "env": {
       "ALLOWLIST_PATH": "./allowlist.yaml",
-      "DATABASE_URL": "postgresql://user:pass@host:5432/mydb"
+      "DATABASE_URL": "postgresql://agent_readonly:REPLACE_ME@host:5432/mydb"
     }
   }
 }
@@ -63,7 +63,7 @@ pip install sanitized-db-mcp
     "args": ["-m", "sanitized_db_mcp.server"],
     "env": {
       "ALLOWLIST_PATH": "./allowlist.yaml",
-      "DATABASE_URL": "postgresql://user:pass@host:5432/mydb"
+      "DATABASE_URL": "postgresql://agent_readonly:REPLACE_ME@host:5432/mydb"
     }
   }
 }
@@ -84,7 +84,7 @@ pip install sanitized-db-mcp
       "ghcr.io/ruminaider/sanitized-db-mcp:latest"
     ],
     "env": {
-      "DATABASE_URL": "postgresql://user:pass@host:5432/mydb"
+      "DATABASE_URL": "postgresql://agent_readonly:REPLACE_ME@host:5432/mydb"
     }
   }
 }
@@ -109,7 +109,7 @@ docker build -t sanitized-db-mcp:local .
       "sanitized-db-mcp:local"
     ],
     "env": {
-      "DATABASE_URL": "postgresql://user:pass@host:5432/mydb"
+      "DATABASE_URL": "postgresql://agent_readonly:REPLACE_ME@host:5432/mydb"
     }
   }
 }
@@ -178,11 +178,18 @@ allowed_functions:
 |---|---|---|---|
 | `ALLOWLIST_PATH` | Yes | -- | Path to `allowlist.yaml` |
 | `MCP_SERVER_NAME` | No | `sanitized-db` | MCP server name (affects tool name: `mcp__<name>__query`) |
-| `DATABASE_URL` | If not using Render | -- | PostgreSQL connection string |
-| `RENDER_POSTGRES_ID` | If using Render | -- | Render Postgres instance ID |
-| `RENDER_API_KEY` | If using Render | -- | Render API bearer token |
+| `DATABASE_URL` | Yes | -- | Explicit PostgreSQL connection string for the dedicated `agent_readonly` login |
 
-The server prefers Render API credentials when both are set. For local development, `DATABASE_URL` is sufficient.
+Remove the legacy Render database discovery settings from the query service.
+Configure the dedicated login with column-level SELECT grants derived from the
+same reviewed allowlist the server loads. Bare table keys refer to `public`.
+Use `schema.table` for other schemas.
+
+The server verifies the PostgreSQL session identity and checks effective SELECT
+grants across application relations, including privileges inherited from roles
+or granted to `PUBLIC`. PostgreSQL system catalog schemas are excluded from the
+comparison. The stdio server checks access at startup. Each query runs the check
+again on its execution connection inside a read-only transaction.
 
 ## Framework Integration
 
@@ -216,7 +223,7 @@ pip install 'sanitized-db-mcp[sse]'
 export MCP_TRANSPORT=sse
 export MCP_API_KEY=your-secret-key
 export ALLOWLIST_PATH=./allowlist.yaml
-export DATABASE_URL=postgresql://...
+export DATABASE_URL=postgresql://agent_readonly:REPLACE_ME@host:5432/mydb
 python -m sanitized_db_mcp.server
 ```
 
@@ -224,7 +231,7 @@ python -m sanitized_db_mcp.server
 
 ```bash
 docker run -e MCP_TRANSPORT=sse -e MCP_API_KEY=secret -e ALLOWLIST_PATH=/app/allowlist.yaml \
-  -e DATABASE_URL=postgresql://... -p 8000:8000 sanitized-db-mcp
+  -e DATABASE_URL=postgresql://agent_readonly:REPLACE_ME@host:5432/mydb -p 8000:8000 sanitized-db-mcp
 ```
 
 ### Claude Code Client Configuration
@@ -249,7 +256,7 @@ In your MCP client config, point to the SSE endpoint:
 
 - `GET /sse` — SSE connection (MCP session)
 - `POST /messages/` — Client-to-server messages
-- `GET /health` — Health check (no auth required)
+- `GET /health` — Database readiness. Returns 200 when the login and grants are verified, or 503 otherwise (no auth required).
 
 ### Deployment Guidance
 
@@ -263,48 +270,30 @@ In your MCP client config, point to the SSE endpoint:
 
 ## How the Sanitizer Works
 
-The server exposes a single MCP tool (`query`) that accepts raw SQL and returns sanitized results. Every query passes through an 11-step pipeline:
+The `query` tool parses one PostgreSQL `SELECT` with pglast, validates its query
+scopes and rewrites its projection before execution. The execution connection
+uses the verified database login, a read-only transaction, and a five-second
+statement timeout.
 
-```
-Agent sends SQL
-      |
-      v
-1.  Parse (pglast) ───── syntax error? → QuerySyntaxError
-      |
-      v
-2.  Statement type ───── not SELECT? → StatementTypeError
-      |                   SELECT INTO? → StatementTypeError
-      |                   FOR UPDATE/SHARE? → StatementTypeError
-      v
-3.  Table validation ─── system catalog? → SystemCatalogError
-      |                   not in allowlist? → RestrictedColumnError
-      |                   TABLESAMPLE? → unwrap, validate inner table
-      v
-4.  Function check ───── always-blocked? → DisallowedFunctionError
-      |                   not in allowlist? → DisallowedFunctionError
-      |                   FILTER (WHERE ...)? → walk with WHERE rules
-      |                   inline OVER clause? → walk with WHERE rules
-      v
-5.  WHERE/JOIN check ─── hidden column? → RestrictedColumnError
-      v
-6.  Clause check ──────── ORDER BY / GROUP BY / DISTINCT ON / WINDOW
-      |                    hidden column? → RestrictedColumnError
-      v
-7.  Subquery check ───── hidden column in subquery/CTE SELECT? → RestrictedColumnError
-      v
-8.  Rewrite SELECT ───── hidden columns → type-preserving placeholders
-      |                   SELECT * → visible columns + redaction marker
-      v
-9.  Serialize AST ────── rewritten SQL string
-      v
-10. Execute ───────────── read-only, 5s timeout, SSL
-      v
-11. Audit log ─────────── structured JSON (original, rewritten, outcome)
-```
+- Physical relations use exact schema and table names. Unqualified policy
+  entries refer to `public`. CTEs, subqueries, and set-operation inputs each
+  validate their own relations and columns.
+- Qualify columns when multiple input relations could provide them. Name
+  computed outputs with `AS` when another query scope refers to them.
+- Use explicit `JOIN ON` predicates and aliases for subqueries in `FROM`.
+  The sanitizer rejects `NATURAL` and `USING` joins, aliases on entire join
+  expressions, column alias lists on physical relations, and recursive CTEs.
+  In `FROM`, it supports `generate_series` with a single scalar output and
+  the built-in `SYSTEM` and `BERNOULLI` sampling methods.
+- A restricted value in an outer projection can be replaced with
+  `[REDACTED]` when its relation is known. Nested projections, predicates,
+  and grouping and ordering expressions require approved column sources.
+- Wildcards expand to approved columns in each scope. An outer wildcard on
+  a physical relation also includes a redaction marker.
 
 ## Security Model
 
-All 200 tests pass with 0 xfails. The pen test suite covers 21 attack categories:
+The synthetic test suite covers query scopes, column resolution, and the database role boundary. The pen test suite covers 21 attack categories:
 
 | Category | Tests | Defense |
 |---|---|---|
@@ -326,8 +315,8 @@ All 200 tests pass with 0 xfails. The pen test suite covers 21 attack categories
 | Encoding edge cases | 4 | Cyrillic homoglyphs, unicode escapes, semicolons in aliases |
 | Timing / side-channel | 4 | pg_sleep, amplification, cross-join, recursive CTE blocked |
 | Error-based extraction | 4 | Generic error messages; no column/table names leaked |
-| Connection security | 5 | SSL, timeout, read-only, autocommit, no connection strings in errors |
-| Allowlist integrity | 4 | Case-insensitive lookup, unknown columns default to hidden |
+| Connection security | 5 | SSL, statement timeout, explicit read-only transactions, no connection strings in errors |
+| Allowlist integrity | 4 | Exact PostgreSQL names for query authorization, unknown columns default to hidden |
 | Audit logging | 4 | All outcomes covered, HIPAA fields present, finally-block guarantee |
 
 ## Running Tests
@@ -335,11 +324,12 @@ All 200 tests pass with 0 xfails. The pen test suite covers 21 attack categories
 ```bash
 cd sanitized-db-mcp
 
-# Full test suite (200 tests across 3 suites)
+# Full test suite
 python -m pytest sanitized_db_mcp/tests/ -v
 
 # Individual suites
-python -m pytest sanitized_db_mcp/tests/test_sanitizer.py -v    # Core rewriting (37 tests)
+python -m pytest sanitized_db_mcp/tests/test_sanitizer.py -v    # Core rewriting
+python -m pytest sanitized_db_mcp/tests/test_query_scopes.py -v # Query scopes and column resolution
 python -m pytest sanitized_db_mcp/tests/test_bypass.py -v       # Bypass resistance (64 tests)
 python -m pytest sanitized_db_mcp/tests/test_pentest.py -v      # Pen test (99 tests)
 python -m pytest sanitized_db_mcp/tests/test_allowlist.py -v    # Allowlist loader
@@ -352,6 +342,6 @@ python -m pytest sanitized_db_mcp/tests/test_allowlist.py -v    # Allowlist load
 | `server.py` | MCP server entry point, `query(sql)` tool |
 | `sanitizer.py` | AST-level SQL rewriting engine |
 | `allowlist.py` | In-memory allowlist representation |
-| `connection.py` | Render API + static connection management |
+| `connection.py` | Dedicated login, grant verification, and read-only execution |
 | `errors.py` | Sanitized error classes (no schema leakage) |
 | `audit.py` | HIPAA-compliant query audit logging |

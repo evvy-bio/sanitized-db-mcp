@@ -201,14 +201,20 @@ class TestBearerAuthMiddleware:
 class TestHealthEndpoint:
     """Tests for the /health endpoint."""
 
-    def test_health_returns_ok(self):
-        from sanitized_db_mcp.transport import health_check
+    def test_unverified_database_is_not_ready(self):
+        from mcp.server import Server
+        from sanitized_db_mcp.errors import ConfigurationError
+        from sanitized_db_mcp.transport import create_sse_app
 
-        app = Starlette(routes=[Route("/health", endpoint=health_check, methods=["GET"])])
-        client = TestClient(app)
-        resp = client.get("/health")
-        assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        def refuse_database():
+            raise ConfigurationError("synthetic database configuration error")
+
+        app = create_sse_app(
+            Server("test-server"), check_database=refuse_database, api_key="test-key"
+        )
+        response = TestClient(app).get("/health")
+        assert response.status_code == 503
+        assert response.json() == {"status": "not_ready"}
 
 
 # ---------------------------------------------------------------------------
@@ -225,18 +231,18 @@ class TestCreateSseApp:
 
     def test_returns_starlette_without_key(self):
         from sanitized_db_mcp.transport import create_sse_app
-        app = create_sse_app(self._make_mock_server())
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None)
         assert isinstance(app, Starlette)
 
     def test_returns_middleware_with_key(self):
         from sanitized_db_mcp.transport import create_sse_app, BearerAuthMiddleware
-        app = create_sse_app(self._make_mock_server(), api_key="test-key")
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None, api_key="test-key")
         assert isinstance(app, BearerAuthMiddleware)
 
     def test_health_accessible_without_auth(self):
         from sanitized_db_mcp.transport import create_sse_app
 
-        app = create_sse_app(self._make_mock_server(), api_key="test-key")
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None, api_key="test-key")
         client = TestClient(app)
         resp = client.get("/health")
         assert resp.status_code == 200
@@ -245,7 +251,7 @@ class TestCreateSseApp:
     def test_sse_endpoint_requires_auth_when_key_set(self):
         from sanitized_db_mcp.transport import create_sse_app
 
-        app = create_sse_app(self._make_mock_server(), api_key="test-key")
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None, api_key="test-key")
         client = TestClient(app)
         resp = client.get("/sse")
         assert resp.status_code == 401
@@ -253,7 +259,7 @@ class TestCreateSseApp:
     def test_messages_endpoint_requires_auth_when_key_set(self):
         from sanitized_db_mcp.transport import create_sse_app
 
-        app = create_sse_app(self._make_mock_server(), api_key="test-key")
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None, api_key="test-key")
         client = TestClient(app)
         resp = client.post("/messages/")
         assert resp.status_code == 401
@@ -262,7 +268,7 @@ class TestCreateSseApp:
         """Without api_key, auth-gated endpoints should be accessible (no 401)."""
         from sanitized_db_mcp.transport import create_sse_app
 
-        app = create_sse_app(self._make_mock_server())
+        app = create_sse_app(self._make_mock_server(), check_database=lambda: None)
         client = TestClient(app, raise_server_exceptions=False)
         # Use /messages/ POST (returns immediately) instead of /sse GET
         # (which opens a long-lived SSE stream that hangs the test).
@@ -287,7 +293,7 @@ class TestHandleSseErrorHandling:
         from sanitized_db_mcp.transport import create_sse_app
 
         server = self._make_mock_server()
-        app = create_sse_app(server)
+        app = create_sse_app(server, check_database=lambda: None)
 
         # Patch server.run on the instance so the handler's try/except is exercised.
         server.run = AsyncMock(side_effect=exc_to_raise)
@@ -363,7 +369,7 @@ class TestHandleSseErrorHandling:
         from mcp.server import Server
 
         server = Server("test-server")
-        app = create_sse_app(server)
+        app = create_sse_app(server, check_database=lambda: None)
         server.run = AsyncMock(side_effect=asyncio.CancelledError())
 
         client = TestClient(app, raise_server_exceptions=False)
@@ -384,7 +390,7 @@ class TestHandleSseErrorHandling:
         from mcp.server import Server
 
         server = Server("test-server")
-        app = create_sse_app(server, session_timeout=0.01)
+        app = create_sse_app(server, check_database=lambda: None, session_timeout=0.01)
 
         # Make server.run block forever so the timeout fires
         async def block_forever(*args, **kwargs):
@@ -405,7 +411,7 @@ class TestHandleSseErrorHandling:
         from mcp.server import Server
 
         server = Server("test-server")
-        app = create_sse_app(server, session_timeout=0.01)
+        app = create_sse_app(server, check_database=lambda: None, session_timeout=0.01)
 
         async def block_forever(*args, **kwargs):
             await asyncio.sleep(3600)

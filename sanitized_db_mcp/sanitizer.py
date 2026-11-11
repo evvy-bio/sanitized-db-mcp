@@ -1,29 +1,12 @@
-"""
-SQL sanitizer using pglast (PostgreSQL's C parser) for AST-level rewriting.
-
-Pipeline:
-  1.  Parse SQL → AST
-  2.  Validate: exactly one SELECT statement
-  3.  Reject: SELECT INTO (intoClause) and FOR UPDATE/SHARE (lockingClause)
-  4.  Validate: no system catalogs
-  5.  Validate: only allowed functions
-  6.  Validate: FILTER (WHERE ...) on aggregates (agg_filter)
-  7.  Validate: inline OVER clauses on window functions (FuncCall.over)
-  8.  Reject: WHERE/HAVING/JOIN ON conditions referencing hidden columns
-  9.  Reject: ORDER BY / GROUP BY / DISTINCT ON / WINDOW referencing hidden columns
-  10. Validate: CTE and subquery SELECT targets for hidden columns
-  11. Rewrite: replace hidden column refs in outer SELECT with placeholders
-  12. Expand: SELECT * → explicit visible columns + redacted marker
-  13. Serialize: AST → rewritten SQL string
-"""
+"""Validate and rewrite PostgreSQL SELECT queries before execution."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import logging
 
-import pglast
-from pglast import parse_sql
+from pglast import ast, parse_sql
+from pglast.enums import A_Expr_Kind, SetOperation
+from pglast.parser import ParseError
 from pglast.stream import RawStream
 
 from .allowlist import Allowlist
@@ -34,9 +17,6 @@ from .errors import (
     StatementTypeError,
     SystemCatalogError,
 )
-
-
-logger = logging.getLogger(__name__)
 
 # System schemas that must never be accessed
 BLOCKED_SCHEMAS = frozenset(
@@ -49,12 +29,7 @@ BLOCKED_SCHEMAS = frozenset(
 )
 
 # System table prefixes to block
-BLOCKED_TABLE_PREFIXES = frozenset(
-    {
-        "pg_",
-        "sql_",
-    }
-)
+BLOCKED_TABLE_PREFIXES = ("pg_", "sql_")
 
 # Functions that can dump entire rows or exfiltrate data
 # (blocked even if they appear to take allowlisted args)
@@ -122,640 +97,395 @@ class SanitizeResult:
 
 
 def sanitize_query(sql: str, allowlist: Allowlist) -> SanitizeResult:
-    """Sanitize a SQL query according to the allowlist.
-
-    Returns a SanitizeResult with the rewritten SQL, or raises
-    a SanitizationError subclass if the query is rejected.
-    """
-    # ------------------------------------------------------------------
-    # 1. Parse
-    # ------------------------------------------------------------------
+    """Return SQL with verified column sources and redacted outer projections."""
     try:
         stmts = parse_sql(sql)
-    except pglast.parser.ParseError as e:
-        raise QuerySyntaxError(f"Parse error: {e}")
+    except ParseError as error:
+        raise QuerySyntaxError(f"Parse error: {error}") from error
 
     if not stmts:
         raise QuerySyntaxError("Empty query")
-
-    # ------------------------------------------------------------------
-    # 2. Validate: exactly one SELECT statement
-    # ------------------------------------------------------------------
-    if len(stmts) > 1:
+    if len(stmts) != 1:
         raise StatementTypeError("Multiple statements are not allowed")
 
-    stmt = stmts[0].stmt
-
-    # pglast wraps in a RawStmt; get the inner statement
-    if not isinstance(stmt, pglast.ast.SelectStmt):
-        raise StatementTypeError(f"Only SELECT statements are allowed, got {type(stmt).__name__}")
-
-    # ------------------------------------------------------------------
-    # 3. Build table alias map from FROM clause
-    # ------------------------------------------------------------------
-    table_aliases = _extract_table_aliases(stmt)
-    tables_accessed = list(table_aliases.values())
-
-    # ------------------------------------------------------------------
-    # 4. Validate tables
-    # ------------------------------------------------------------------
-    _validate_tables(tables_accessed, allowlist)
-
-    # ------------------------------------------------------------------
-    # 5. Validate the full AST
-    # ------------------------------------------------------------------
-    columns_accessed = []
-    columns_redacted = []
-
-    # Walk the AST to validate functions, WHERE/JOIN columns
-    _validate_ast(stmt, allowlist, table_aliases)
-
-    # ------------------------------------------------------------------
-    # 6. Rewrite SELECT columns
-    # ------------------------------------------------------------------
-    was_rewritten = _rewrite_select_targets(
-        stmt, allowlist, table_aliases, columns_accessed, columns_redacted
-    )
-
-    # ------------------------------------------------------------------
-    # 7. Serialize back to SQL
-    # ------------------------------------------------------------------
-    rewritten_sql = RawStream()(stmts[0])
-
-    return SanitizeResult(
-        original_sql=sql,
-        rewritten_sql=rewritten_sql,
-        tables_accessed=tables_accessed,
-        columns_accessed=columns_accessed,
-        columns_redacted=columns_redacted,
-        was_rewritten=was_rewritten,
-    )
+    result = SanitizeResult(original_sql=sql, rewritten_sql="")
+    _QueryValidator(allowlist, result).select(stmts[0].stmt, {}, redact=True)
+    result.rewritten_sql = RawStream()(stmts[0])
+    result.tables_accessed = list(dict.fromkeys(result.tables_accessed))
+    result.columns_accessed = list(dict.fromkeys(result.columns_accessed))
+    result.columns_redacted = list(dict.fromkeys(result.columns_redacted))
+    return result
 
 
-# ======================================================================
-# AST helpers
-# ======================================================================
+# Unknown labels occur on computed outputs without an explicit alias.
+_Output = tuple[str | None, ...]
+_CTEs = dict[str, _Output]
 
 
-def _extract_table_aliases(stmt) -> dict[str, str]:
-    """Extract a mapping of alias → real table name from FROM clause.
+@dataclass(frozen=True)
+class _Source:
+    qualifier: tuple[str, ...]
+    columns: _Output
+    table: str | None = None
 
-    If no alias, the table name maps to itself.
-    """
-    aliases: dict[str, str] = {}
-    _walk_from_clause(stmt.fromClause, aliases)
-    return aliases
+    @property
+    def name(self) -> str:
+        return self.qualifier[-1]
 
-
-def _walk_from_clause(from_list, aliases: dict[str, str]):
-    """Recursively walk FROM clause items to extract table references."""
-    if from_list is None:
-        return
-
-    for item in from_list:
-        if isinstance(item, pglast.ast.RangeVar):
-            table_name = item.relname
-            if item.schemaname:
-                # Check for blocked schemas
-                if item.schemaname.lower() in BLOCKED_SCHEMAS:
-                    raise SystemCatalogError(f"Access to schema {item.schemaname} is blocked")
-                table_name = f"{item.schemaname}.{item.relname}"
-
-            alias = item.alias.aliasname if item.alias else item.relname
-            aliases[alias] = table_name
-
-        elif isinstance(item, pglast.ast.JoinExpr):
-            # Recurse into JOIN
-            _walk_join(item, aliases)
-
-        elif isinstance(item, pglast.ast.RangeSubselect):
-            # Subquery in FROM — validate it recursively
-            if item.subquery and isinstance(item.subquery, pglast.ast.SelectStmt):
-                sub_aliases = _extract_table_aliases(item.subquery)
-                # Validate subquery tables
-                for tbl in sub_aliases.values():
-                    _check_table_name(tbl)
-                # The subquery's alias becomes a "virtual table" — we don't
-                # add its inner tables to the outer scope
-                if item.alias:
-                    aliases[item.alias.aliasname] = f"__subquery_{item.alias.aliasname}"
-
-        elif isinstance(item, pglast.ast.RangeFunction):
-            # Table-returning function (e.g., generate_series)
-            if item.alias:
-                aliases[item.alias.aliasname] = f"__func_{item.alias.aliasname}"
-
-        elif isinstance(item, pglast.ast.RangeTableSample):
-            # TABLESAMPLE wraps a RangeVar — extract the underlying table
-            if item.relation:
-                _walk_from_clause([item.relation], aliases)
+    def may_have_column(self, column: str) -> bool:
+        # The policy has no inventory of hidden physical columns.
+        return self.table is not None or column in self.columns or None in self.columns
 
 
-def _walk_join(join_expr, aliases: dict[str, str]):
-    """Walk a JoinExpr to extract table references."""
-    # Left side
-    if isinstance(join_expr.larg, pglast.ast.RangeVar):
-        _walk_from_clause([join_expr.larg], aliases)
-    elif isinstance(join_expr.larg, pglast.ast.JoinExpr):
-        _walk_join(join_expr.larg, aliases)
-    elif isinstance(join_expr.larg, pglast.ast.RangeSubselect):
-        _walk_from_clause([join_expr.larg], aliases)
-
-    # Right side
-    if isinstance(join_expr.rarg, pglast.ast.RangeVar):
-        _walk_from_clause([join_expr.rarg], aliases)
-    elif isinstance(join_expr.rarg, pglast.ast.JoinExpr):
-        _walk_join(join_expr.rarg, aliases)
-    elif isinstance(join_expr.rarg, pglast.ast.RangeSubselect):
-        _walk_from_clause([join_expr.rarg], aliases)
+_Scope = tuple[_Source, ...]
+_Scopes = tuple[_Scope, ...]
 
 
-def _check_table_name(table_name: str):
-    """Raise if the table name matches blocked patterns."""
-    lower = table_name.lower()
-    for prefix in BLOCKED_TABLE_PREFIXES:
-        if lower.startswith(prefix):
-            raise SystemCatalogError(f"Access to table {table_name} is blocked")
+class _QueryValidator:
+    def __init__(self, allowlist: Allowlist, result: SanitizeResult):
+        self.allowlist = allowlist
+        self.result = result
 
+    def select(
+        self,
+        stmt: ast.Node,
+        ctes: _CTEs,
+        outer: _Scopes = (),
+        *,
+        redact: bool = False,
+    ) -> _Output:
+        if not isinstance(stmt, ast.SelectStmt):
+            raise StatementTypeError(f"Only SELECT statements are allowed, got {type(stmt).__name__}")
+        if stmt.intoClause or stmt.lockingClause:
+            raise StatementTypeError("SELECT INTO and locking clauses are not allowed")
 
-def _validate_tables(tables: list[str], allowlist: Allowlist):
-    """Validate that all referenced tables are in the allowlist."""
-    for table in tables:
-        # Skip virtual tables (subqueries, functions)
-        if table.startswith("__subquery_") or table.startswith("__func_"):
-            continue
+        if stmt.withClause:
+            if stmt.withClause.recursive:
+                raise RestrictedColumnError("Recursive CTE output cannot be resolved")
+            ctes = ctes.copy()
+            names = set()
+            for cte in stmt.withClause.ctes:
+                if cte.ctename in names:
+                    raise RestrictedColumnError("Duplicate CTE name")
+                columns = self.select(cte.ctequery, ctes, outer)
+                ctes[cte.ctename] = _rename_columns(columns, cte.aliascolnames)
+                names.add(cte.ctename)
 
-        _check_table_name(table)
+        sources: _Scope = ()
+        for item in stmt.fromClause or ():
+            sources += self._from_item(item, ctes, outer, sources)
+        scopes = (sources, *outer)
 
-        if not allowlist.has_table(table):
-            raise RestrictedColumnError(f"Table {table} is not in the allowlist")
+        if stmt.op != SetOperation.SETOP_NONE:
+            columns = self.select(stmt.larg, ctes, outer)
+            if len(columns) != len(self.select(stmt.rarg, ctes, outer)):
+                raise RestrictedColumnError("Set operation inputs have different column counts")
+        elif stmt.valuesLists:
+            width = len(stmt.valuesLists[0])
+            if any(len(row) != width for row in stmt.valuesLists):
+                raise RestrictedColumnError("VALUES rows have different column counts")
+            self._expression(stmt.valuesLists, scopes, ctes)
+            columns = tuple(f"column{position}" for position in range(1, width + 1))
+        else:
+            columns = self._project(stmt, scopes, ctes, redact)
 
+        for clause in (
+            stmt.whereClause, stmt.havingClause, stmt.windowClause, stmt.limitOffset, stmt.limitCount,
+        ):
+            self._expression(clause, scopes, ctes)
 
-# ======================================================================
-# Function validation
-# ======================================================================
+        # Set operations expose their output columns to ORDER BY.
+        sort_scopes = () if stmt.op != SetOperation.SETOP_NONE else scopes
+        for sort in stmt.sortClause or ():
+            self._sort_or_group(sort.node, columns, sort_scopes, ctes)
+        for item in stmt.distinctClause or ():
+            self._sort_or_group(item, columns, scopes, ctes)
+        for item in stmt.groupClause or ():
+            self._sort_or_group(item, columns, scopes, ctes, grouping=True)
+        return columns
 
+    def _from_item(
+        self, item: ast.Node, ctes: _CTEs, outer: _Scopes, preceding: _Scope
+    ) -> _Scope:
+        if isinstance(item, ast.RangeVar):
+            return (self._relation(item, ctes),)
 
-def _validate_ast(stmt, allowlist: Allowlist, table_aliases: dict[str, str]):
-    """Walk the full AST to validate functions and WHERE/JOIN column refs."""
-    _walk_node(stmt, allowlist, table_aliases, in_where=False)
+        if isinstance(item, ast.RangeSubselect):
+            columns = self.select(item.subquery, ctes, (preceding, *outer) if item.lateral else outer)
+            if item.alias is None:
+                raise RestrictedColumnError("A FROM subquery requires an alias")
+            return (_Source((item.alias.aliasname,), _rename_columns(columns, item.alias.colnames)),)
 
+        if isinstance(item, ast.JoinExpr):
+            if item.isNatural or item.usingClause or item.alias:
+                raise RestrictedColumnError("Use an explicit JOIN ON with named input relations")
+            left = self._from_item(item.larg, ctes, outer, preceding)
+            right = self._from_item(item.rarg, ctes, outer, preceding + left)
+            joined = left + right
+            self._expression(item.quals, (joined, *outer), ctes)
+            return joined
 
-def _walk_node(node, allowlist: Allowlist, table_aliases: dict[str, str], in_where: bool):
-    """Recursively walk an AST node for validation."""
-    if node is None:
-        return
+        if isinstance(item, ast.RangeTableSample):
+            source = self._relation(item.relation, ctes)
+            method = tuple(part.sval for part in item.method)
+            if source.table is None or method not in {
+                ("system",), ("bernoulli",), ("pg_catalog", "system"), ("pg_catalog", "bernoulli"),
+            }:
+                raise RestrictedColumnError("TABLESAMPLE requires a base relation and a built-in method")
+            self._expression((item.args, item.repeatable), outer, ctes)
+            # The execution search path starts with pg_catalog. RawStream
+            # cannot serialize qualified TABLESAMPLE method names.
+            item.method = _identifiers((method[-1],))
+            return (source,)
 
-    if isinstance(node, pglast.ast.FuncCall):
-        _validate_function(node, allowlist)
-        # Walk FILTER (WHERE ...) clause — semantically a WHERE condition
-        if node.agg_filter:
-            _walk_node(node.agg_filter, allowlist, table_aliases, in_where=True)
-        # Walk inline OVER clause — PARTITION BY / ORDER BY leak hidden column info
-        if node.over:
-            _walk_node(node.over, allowlist, table_aliases, in_where=True)
+        if isinstance(item, ast.RangeFunction):
+            return (self._range_function(item, (preceding, *outer), ctes),)
 
-    if isinstance(node, pglast.ast.XmlExpr):
-        raise DisallowedFunctionError("XML functions are not allowed")
+        raise RestrictedColumnError(f"Cannot resolve FROM source {type(item).__name__}")
 
-    if isinstance(node, pglast.ast.ColumnRef):
-        if in_where:
-            _validate_where_column(node, allowlist, table_aliases)
+    def _relation(self, item: ast.RangeVar, ctes: _CTEs) -> _Source:
+        if item.catalogname:
+            raise RestrictedColumnError("Database-qualified relations are not supported")
+        name = item.alias.aliasname if item.alias else item.relname
+        aliases = item.alias.colnames if item.alias else None
+        if item.schemaname is None and item.relname in ctes:
+            return _Source((name,), _rename_columns(ctes[item.relname], aliases))
 
-    # Check WHERE clause
-    if isinstance(node, pglast.ast.SelectStmt):
-        if node.whereClause:
-            _walk_node(node.whereClause, allowlist, table_aliases, in_where=True)
-        if node.havingClause:
-            _walk_node(node.havingClause, allowlist, table_aliases, in_where=True)
-        # Validate FROM clause JOINs (ON conditions), table-returning functions,
-        # and subqueries in FROM
-        if node.fromClause:
-            for item in node.fromClause:
-                if isinstance(item, pglast.ast.JoinExpr):
-                    _validate_join_condition(item, allowlist, table_aliases)
-                if isinstance(item, pglast.ast.RangeFunction):
-                    _validate_range_function(item, allowlist)
-                if isinstance(item, pglast.ast.RangeSubselect):
-                    if item.subquery and isinstance(item.subquery, pglast.ast.SelectStmt):
-                        sub_aliases = _extract_table_aliases(item.subquery)
-                        _validate_tables(list(sub_aliases.values()), allowlist)
-                        _validate_ast(item.subquery, allowlist, sub_aliases)
-                        _validate_select_targets(item.subquery, allowlist, sub_aliases)
+        schema = item.schemaname or "public"
+        if schema.lower() in BLOCKED_SCHEMAS or schema.lower().startswith(("pg_temp_", "pg_toast_")):
+            raise SystemCatalogError(f"Access to schema {schema} is blocked")
+        if item.relname.lower().startswith(BLOCKED_TABLE_PREFIXES):
+            raise SystemCatalogError(f"Access to table {item.relname} is blocked")
 
-        # Validate subqueries in target list
-        if node.targetList:
-            for target in node.targetList:
-                if isinstance(target, pglast.ast.ResTarget) and target.val:
-                    _walk_node(target.val, allowlist, table_aliases, in_where=False)
+        columns = self.allowlist.database_table_columns(schema, item.relname)
+        if columns is None:
+            raise RestrictedColumnError(f"Table {schema}.{item.relname} is not in the allowlist")
+        if aliases:
+            raise RestrictedColumnError("Column alias lists on base relations cannot be resolved")
 
-        # Validate CTEs
-        if node.withClause and node.withClause.ctes:
-            for cte in node.withClause.ctes:
-                if isinstance(cte, pglast.ast.CommonTableExpr) and cte.ctequery:
-                    if isinstance(cte.ctequery, pglast.ast.SelectStmt):
-                        cte_aliases = _extract_table_aliases(cte.ctequery)
-                        _validate_ast(cte.ctequery, allowlist, cte_aliases)
-                        _validate_select_targets(cte.ctequery, allowlist, cte_aliases)
+        item.schemaname = schema
+        table = item.relname if schema == "public" else f"{schema}.{item.relname}"
+        self.result.tables_accessed.append(table)
+        qualifier = (name,) if item.alias else (schema, name)
+        return _Source(qualifier, columns, table)
 
-        # Validate UNION/INTERSECT/EXCEPT
-        if node.larg:
-            if isinstance(node.larg, pglast.ast.SelectStmt):
-                larg_aliases = _extract_table_aliases(node.larg)
-                _validate_ast(node.larg, allowlist, larg_aliases)
-                _validate_select_targets(node.larg, allowlist, larg_aliases)
-        if node.rarg:
-            if isinstance(node.rarg, pglast.ast.SelectStmt):
-                rarg_aliases = _extract_table_aliases(node.rarg)
-                _validate_ast(node.rarg, allowlist, rarg_aliases)
-                _validate_select_targets(node.rarg, allowlist, rarg_aliases)
+    def _range_function(self, item: ast.RangeFunction, scopes: _Scopes, ctes: _CTEs) -> _Source:
+        self._expression(item.functions, scopes, ctes)
+        if item.ordinality or item.is_rowsfrom or item.coldeflist or len(item.functions) != 1:
+            raise RestrictedColumnError("Cannot resolve columns returned by FROM function")
+        call, definitions = item.functions[0]
+        if (
+            definitions or not isinstance(call, ast.FuncCall)
+            or tuple(part.sval for part in call.funcname) != ("generate_series",)
+        ):
+            raise RestrictedColumnError("Cannot resolve columns returned by FROM function")
 
-        # Reject locking clauses (FOR UPDATE, FOR SHARE, etc.)
-        if node.lockingClause:
-            raise StatementTypeError("Locking clauses (FOR UPDATE, FOR SHARE) are not allowed")
+        # This built-in has one scalar output whose name is determined by the alias.
+        call.funcname = _identifiers(("pg_catalog", "generate_series"))
+        name = item.alias.aliasname if item.alias else "generate_series"
+        aliases = item.alias.colnames if item.alias else None
+        return _Source((name,), _rename_columns((name,), aliases))
 
-        # Reject SELECT INTO (creates a table)
-        if node.intoClause:
-            raise StatementTypeError("SELECT INTO is not allowed")
-
-        # Validate ORDER BY — hidden columns leak sort order
-        if node.sortClause:
-            for sort_item in node.sortClause:
-                _walk_node(sort_item, allowlist, table_aliases, in_where=True)
-
-        # Validate GROUP BY — hidden columns leak grouping
-        if node.groupClause:
-            for group_item in node.groupClause:
-                _walk_node(group_item, allowlist, table_aliases, in_where=True)
-
-        # Validate DISTINCT ON — hidden columns leak uniqueness
-        if node.distinctClause:
-            for distinct_item in node.distinctClause:
-                _walk_node(distinct_item, allowlist, table_aliases, in_where=True)
-
-        # Validate WINDOW definitions — hidden columns in PARTITION BY / ORDER BY
-        if node.windowClause:
-            for window_def in node.windowClause:
-                _walk_node(window_def, allowlist, table_aliases, in_where=True)
-
-        return  # Don't recurse further — we handled sub-parts above
-
-    if isinstance(node, pglast.ast.SubLink):
-        # Subquery in expression (EXISTS, IN, scalar subquery)
-        if node.subselect and isinstance(node.subselect, pglast.ast.SelectStmt):
-            sub_aliases = _extract_table_aliases(node.subselect)
-            _validate_tables(list(sub_aliases.values()), allowlist)
-            _validate_ast(node.subselect, allowlist, sub_aliases)
-            _validate_select_targets(node.subselect, allowlist, sub_aliases)
-        return
-
-    # Generic recursion for other node types
-    if isinstance(node, pglast.ast.Node):
-        for attr_name in node.__slots__:  # type: ignore[attr-defined]
-            attr = getattr(node, attr_name, None)
-            if attr is None:
+    def _project(self, stmt: ast.SelectStmt, scopes: _Scopes, ctes: _CTEs, redact: bool) -> _Output:
+        targets = []
+        for target in stmt.targetList or ():
+            value = target.val
+            if isinstance(value, ast.ColumnRef) and isinstance(value.fields[-1], ast.A_Star):
+                targets.extend(self._expand_star(value, scopes, redact))
+                self.result.was_rewritten = True
                 continue
-            if isinstance(attr, pglast.ast.Node):
-                _walk_node(attr, allowlist, table_aliases, in_where=in_where)
-            elif isinstance(attr, tuple):
-                for item in attr:
-                    if isinstance(item, pglast.ast.Node):
-                        _walk_node(item, allowlist, table_aliases, in_where=in_where)
 
+            hidden = [] if redact else None
+            self._expression(value, scopes, ctes, hidden)
+            if hidden:
+                self.result.columns_redacted.extend(hidden)
+                name = target.name or (
+                    value.fields[-1].sval if isinstance(value, ast.ColumnRef) else "redacted"
+                )
+                target = _redacted_target(name)
+                self.result.was_rewritten = True
+            targets.append(target)
 
-def _validate_select_targets(stmt, allowlist: Allowlist, table_aliases: dict[str, str]):
-    """Validate that SELECT targets don't reference hidden columns.
+        if stmt.targetList is not None:
+            stmt.targetList = tuple(targets)
+        return tuple(_output_name(target) for target in targets)
 
-    Used for subqueries where we reject rather than rewrite.
-    """
-    if stmt.targetList is None:
-        return
+    def _expand_star(self, ref: ast.ColumnRef, scopes: _Scopes, markers: bool) -> list[ast.ResTarget]:
+        qualifier = tuple(field.sval for field in ref.fields[:-1])
+        sources = (_qualified_source(qualifier, scopes),) if qualifier else scopes[0]
+        if not sources:
+            raise RestrictedColumnError("Wildcard has no visible source")
 
-    for target in stmt.targetList:
-        if not isinstance(target, pglast.ast.ResTarget):
-            continue
-        val = target.val
+        targets = []
+        for source in sources:
+            _qualified_source(source.qualifier, scopes)
+            if None in source.columns or len(set(source.columns)) != len(source.columns):
+                raise RestrictedColumnError("Wildcard output requires unique, known column names")
+            for column in source.columns:
+                if source.table is not None:
+                    self.result.columns_accessed.append(f"{source.table}.{column}")
+                targets.append(ast.ResTarget(
+                    val=ast.ColumnRef(fields=_identifiers((*source.qualifier, column))),
+                ))
+            if markers and source.table is not None:
+                name = f"_{source.name}_redacted_columns"
+                targets.append(_redacted_target(name.encode()[:63].decode(errors="ignore")))
+        if not targets:
+            raise RestrictedColumnError("Wildcard has no approved columns")
+        return targets
 
-        # Check direct column references
-        if isinstance(val, pglast.ast.ColumnRef):
-            table, column = _resolve_column_ref(val, table_aliases)
-            if table and column and not table.startswith("__"):
-                if allowlist.has_table(table) and not allowlist.is_column_visible(table, column):
-                    raise RestrictedColumnError("Hidden column in subquery SELECT is not allowed")
-
-        # Check expressions containing hidden column refs
-        expr_columns = _extract_column_refs(val, table_aliases)
-        for tbl, col in expr_columns:
-            if tbl and not tbl.startswith("__") and allowlist.has_table(tbl):
-                if not allowlist.is_column_visible(tbl, col):
-                    raise RestrictedColumnError(
-                        "Hidden column in subquery expression is not allowed"
-                    )
-
-
-def _validate_range_function(range_func, allowlist: Allowlist):
-    """Validate function calls in FROM clause (e.g., dblink)."""
-    if range_func.functions:
-        for func_tuple in range_func.functions:
-            if isinstance(func_tuple, tuple):
-                for func_item in func_tuple:
-                    if isinstance(func_item, pglast.ast.FuncCall):
-                        _validate_function(func_item, allowlist)
-
-
-def _validate_function(func_call, allowlist: Allowlist):
-    """Validate that a function call is on the allowed list."""
-    if not func_call.funcname:
-        return
-
-    func_parts = []
-    for part in func_call.funcname:
-        if isinstance(part, pglast.ast.String):
-            func_parts.append(part.sval)
-
-    if not func_parts:
-        return
-
-    func_name = func_parts[-1].upper()
-
-    # Check always-blocked list first
-    if func_name in ALWAYS_BLOCKED_FUNCTIONS:
-        raise DisallowedFunctionError(f"Function {func_name} is not allowed")
-
-    # Check schema-qualified functions (block pg_catalog.* etc.)
-    if len(func_parts) > 1:
-        schema = func_parts[0].lower()
-        if schema in BLOCKED_SCHEMAS:
-            raise SystemCatalogError(f"Function in schema {schema} is not allowed")
-
-    # Check against allowlist
-    if not allowlist.is_function_allowed(func_name):
-        raise DisallowedFunctionError(f"Function {func_name} is not on the allowed list")
-
-    # Check for star in function args (e.g., json_agg(t.*))
-    # COUNT(*) is safe — it just counts rows, no data exposure
-    if func_call.agg_star and func_name != "COUNT":
-        raise DisallowedFunctionError(
-            f"Star (*) in function arguments is not allowed: {func_name}(*)"
-        )
-
-
-def _validate_where_column(col_ref, allowlist: Allowlist, table_aliases: dict[str, str]):
-    """Validate that a column reference in WHERE/JOIN is allowlisted."""
-    table, column = _resolve_column_ref(col_ref, table_aliases)
-    if table and column:
-        # Skip virtual tables
-        if table.startswith("__subquery_") or table.startswith("__func_"):
-            return
-        if not allowlist.is_column_visible(table, column):
-            raise RestrictedColumnError(
-                f"Column {table}.{column} cannot be used in WHERE/JOIN conditions"
-            )
-
-
-def _validate_join_condition(join_expr, allowlist: Allowlist, table_aliases: dict[str, str]):
-    """Validate ON condition of a JOIN."""
-    if join_expr.quals:
-        _walk_node(join_expr.quals, allowlist, table_aliases, in_where=True)
-
-    # Recurse into nested joins
-    if isinstance(join_expr.larg, pglast.ast.JoinExpr):
-        _validate_join_condition(join_expr.larg, allowlist, table_aliases)
-    if isinstance(join_expr.rarg, pglast.ast.JoinExpr):
-        _validate_join_condition(join_expr.rarg, allowlist, table_aliases)
-
-
-def _resolve_column_ref(col_ref, table_aliases: dict[str, str]) -> tuple[str | None, str | None]:
-    """Resolve a ColumnRef to (table_name, column_name).
-
-    Returns (None, None) for unresolvable references (e.g., standalone *).
-    """
-    if not col_ref.fields:
-        return None, None
-
-    fields = []
-    for f in col_ref.fields:
-        if isinstance(f, pglast.ast.String):
-            fields.append(f.sval)
-        elif isinstance(f, pglast.ast.A_Star):
-            fields.append("*")
-
-    if len(fields) == 1:
-        # Unqualified column — try to resolve from single table
-        col = fields[0]
-        if col == "*":
-            return None, None
-        if len(table_aliases) == 1:
-            table = list(table_aliases.values())[0]
-            return table, col
-        # Ambiguous — can't resolve without table qualifier
-        # Be conservative: check all tables
-        for real_table in table_aliases.values():
-            if real_table.startswith("__"):
-                continue
-            if not allowlist_check_column_exists(real_table, col):
-                continue
-            return real_table, col
-        return None, col
-
-    if len(fields) == 2:
-        alias, col = fields
-        if col == "*":
-            return table_aliases.get(alias, alias), None
-        real_table = table_aliases.get(alias, alias)
-        return real_table, col
-
-    return None, None
-
-
-def allowlist_check_column_exists(table: str, column: str) -> bool:
-    """Placeholder — used only for ambiguous resolution.
-
-    In practice, we rely on the allowlist passed to sanitize_query.
-    """
-    return True
-
-
-# ======================================================================
-# SELECT target rewriting
-# ======================================================================
-
-
-def _rewrite_select_targets(
-    stmt,
-    allowlist: Allowlist,
-    table_aliases: dict[str, str],
-    columns_accessed: list[str],
-    columns_redacted: list[str],
-) -> bool:
-    """Rewrite SELECT target list to replace non-allowlisted columns.
-
-    Returns True if any rewriting occurred.
-    """
-    if stmt.targetList is None:
-        return False
-
-    was_rewritten = False
-    new_targets = []
-
-    for target in stmt.targetList:
-        if not isinstance(target, pglast.ast.ResTarget):
-            new_targets.append(target)
-            continue
-
-        val = target.val
-
-        # Handle SELECT * (bare star)
-        if isinstance(val, pglast.ast.ColumnRef) and _is_star(val):
-            # Expand to explicit columns
-            star_targets = _expand_star(
-                val, allowlist, table_aliases, columns_accessed, columns_redacted
-            )
-            new_targets.extend(star_targets)
-            was_rewritten = True
-            continue
-
-        # Handle regular column reference
-        if isinstance(val, pglast.ast.ColumnRef):
-            table, column = _resolve_column_ref(val, table_aliases)
-            if table and column:
-                if table.startswith("__"):
-                    # Virtual table — pass through
-                    columns_accessed.append(f"{table}.{column}")
-                    new_targets.append(target)
-                elif allowlist.is_column_visible(table, column):
-                    columns_accessed.append(f"{table}.{column}")
-                    new_targets.append(target)
+    def _expression(
+        self,
+        node: object,
+        scopes: _Scopes,
+        ctes: _CTEs,
+        hidden: list[str] | None = None,
+    ) -> None:
+        if isinstance(node, ast.ColumnRef):
+            source, column = _resolve_column(node, scopes)
+            if source.table is not None:
+                name = f"{source.table}.{column}"
+                if column in source.columns:
+                    self.result.columns_accessed.append(name)
+                elif hidden is not None:
+                    hidden.append(name)
                 else:
-                    # Replace with placeholder
-                    columns_redacted.append(f"{table}.{column}")
-                    placeholder = allowlist.get_placeholder(table, column)
-                    new_targets.append(_make_placeholder_target(placeholder, target.name or column))
-                    was_rewritten = True
-            else:
-                # Can't resolve — pass through (conservative)
-                new_targets.append(target)
-            continue
+                    raise RestrictedColumnError(f"Column {name} is restricted in this expression")
+            return
 
-        # Handle expressions (functions, operators, CASE, etc.)
-        # Check if any source column in the expression is non-allowlisted
-        expr_columns = _extract_column_refs(val, table_aliases)
-        has_hidden = False
-        for tbl, col in expr_columns:
-            if tbl and not tbl.startswith("__") and not allowlist.is_column_visible(tbl, col):
-                has_hidden = True
-                columns_redacted.append(f"{tbl}.{col}")
-            else:
-                columns_accessed.append(f"{tbl}.{col}" if tbl else col)
+        if isinstance(node, ast.SubLink):
+            self._expression(node.testexpr, scopes, ctes)
+            self.select(node.subselect, ctes, scopes)
+            return
 
-        if has_hidden:
-            # Replace entire expression with placeholder
-            alias = target.name or "redacted"
-            new_targets.append(_make_placeholder_target("'[REDACTED]'", alias))
-            was_rewritten = True
-        else:
-            new_targets.append(target)
+        if isinstance(node, ast.SelectStmt):
+            self.select(node, ctes, scopes)
+            return
 
-    stmt.targetList = tuple(new_targets)
-    return was_rewritten
+        if isinstance(node, ast.XmlExpr):
+            raise DisallowedFunctionError("XML functions are not allowed")
+
+        if isinstance(node, ast.A_Indirection) and any(
+            not isinstance(index, ast.A_Indices) for index in node.indirection
+        ):
+            raise RestrictedColumnError("Record field references cannot be resolved")
+
+        if isinstance(node, ast.FuncCall):
+            _validate_function(node, self.allowlist)
+
+        if isinstance(node, tuple):
+            for child in node:
+                self._expression(child, scopes, ctes, hidden)
+        elif isinstance(node, ast.Node):
+            for attr in node.__slots__:
+                # These expressions affect which rows an aggregate or window uses.
+                child_hidden = None if isinstance(node, ast.FuncCall) and attr in {
+                    "agg_filter", "agg_order", "over",
+                } else hidden
+                self._expression(getattr(node, attr), scopes, ctes, child_hidden)
+
+    def _sort_or_group(
+        self, node: ast.Node, columns: _Output, scopes: _Scopes, ctes: _CTEs, *, grouping: bool = False
+    ) -> None:
+        if isinstance(node, ast.GroupingSet):
+            for item in node.content or ():
+                self._sort_or_group(item, columns, scopes, ctes, grouping=grouping)
+            return
+        if isinstance(node, ast.A_Const) and isinstance(node.val, ast.Integer):
+            if not 1 <= node.val.ival <= len(columns):
+                raise RestrictedColumnError("Projection position is out of range")
+            return
+        if isinstance(node, ast.ColumnRef) and len(node.fields) == 1:
+            field = node.fields[0]
+            # GROUP BY prefers input names. ORDER BY and DISTINCT ON prefer output names.
+            if isinstance(field, ast.String) and not (
+                grouping and any(source.may_have_column(field.sval) for source in scopes[0])
+            ):
+                count = columns.count(field.sval)
+                if None in columns or count > 1:
+                    raise RestrictedColumnError("Use unique, explicit projection aliases or a qualified column")
+                if count == 1:
+                    return
+        self._expression(node, scopes, ctes)
 
 
-def _is_star(col_ref) -> bool:
-    """Check if a ColumnRef is * or alias.*"""
-    if not col_ref.fields:
-        return False
-    last = col_ref.fields[-1]
-    return isinstance(last, pglast.ast.A_Star)
+def _qualified_source(qualifier: tuple[str, ...], scopes: _Scopes) -> _Source:
+    if len(qualifier) not in (1, 2):
+        raise RestrictedColumnError("Unsupported column qualifier")
+    for scope in scopes:
+        matches = [s for s in scope if qualifier == (s.name,) or qualifier == s.qualifier]
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            raise RestrictedColumnError("Ambiguous column qualifier")
+    raise RestrictedColumnError("Unknown column qualifier")
 
 
-def _expand_star(
-    col_ref,
-    allowlist: Allowlist,
-    table_aliases: dict[str, str],
-    columns_accessed: list[str],
-    columns_redacted: list[str],
-) -> list:
-    """Expand a SELECT * or alias.* into explicit column targets."""
-    # Determine which table(s) the star refers to
-    if len(col_ref.fields) == 1:
-        # Bare * — expand all tables
-        tables_to_expand = list(table_aliases.items())
+def _resolve_column(ref: ast.ColumnRef, scopes: _Scopes) -> tuple[_Source, str]:
+    if not ref.fields or any(not isinstance(field, ast.String) for field in ref.fields):
+        raise RestrictedColumnError("Whole-row references and expression wildcards are not allowed")
+    *qualifier, column = (field.sval for field in ref.fields)
+    if qualifier:
+        source = _qualified_source(tuple(qualifier), scopes)
     else:
-        # alias.* — expand just that table
-        alias = col_ref.fields[0].sval if isinstance(col_ref.fields[0], pglast.ast.String) else None
-        if alias and alias in table_aliases:
-            tables_to_expand = [(alias, table_aliases[alias])]
-        else:
-            tables_to_expand = []
-
-    targets = []
-    for alias, real_table in tables_to_expand:
-        if real_table.startswith("__"):
-            continue
-
-        visible_cols = allowlist.get_visible_columns(real_table)
-        # We need to know ALL columns to do proper expansion.
-        # For visible ones, emit the real column; for hidden ones, emit placeholder.
-        # Since we don't have the full column list from the allowlist alone,
-        # we emit only visible columns from the allowlist.
-        # Hidden columns get a single redacted placeholder to signal their existence.
-        for col_name in sorted(visible_cols):
-            columns_accessed.append(f"{real_table}.{col_name}")
-            targets.append(_make_column_target(alias, col_name))
-
-        # Add a marker for redacted columns
-        targets.append(_make_placeholder_target("'[REDACTED]'", f"_{alias}_redacted_columns"))
-
-    return targets
+        source = _unqualified_source(column, scopes)
+    if source.table is None and (None in source.columns or source.columns.count(column) != 1):
+        raise RestrictedColumnError("Column has no unique output in the referenced source")
+    return source, column
 
 
-def _extract_column_refs(node, table_aliases: dict[str, str]) -> list[tuple[str | None, str]]:
-    """Extract all column references from an expression node."""
-    refs = []
-    _collect_column_refs(node, table_aliases, refs)
-    return refs
+def _unqualified_source(column: str, scopes: _Scopes) -> _Source:
+    for scope in scopes:
+        matches = [source for source in scope if source.may_have_column(column)]
+        if len(matches) > 1:
+            raise RestrictedColumnError("Qualify columns that could belong to multiple sources")
+        if matches:
+            source = matches[0]
+            if column not in source.columns and any(s.name == column for s in scope):
+                raise RestrictedColumnError("Whole-row references are not allowed")
+            return source
+    raise RestrictedColumnError("Column has no visible source")
 
 
-def _collect_column_refs(node, table_aliases: dict[str, str], refs: list):
-    """Recursively collect column references."""
-    if node is None:
-        return
-
-    if isinstance(node, pglast.ast.ColumnRef):
-        table, column = _resolve_column_ref(node, table_aliases)
-        if column and column != "*":
-            refs.append((table, column))
-        return
-
-    if isinstance(node, pglast.ast.Node):
-        for attr_name in node.__slots__:  # type: ignore[attr-defined]
-            attr = getattr(node, attr_name, None)
-            if attr is None:
-                continue
-            if isinstance(attr, pglast.ast.Node):
-                _collect_column_refs(attr, table_aliases, refs)
-            elif isinstance(attr, tuple):
-                for item in attr:
-                    if isinstance(item, pglast.ast.Node):
-                        _collect_column_refs(item, table_aliases, refs)
+def _rename_columns(columns: _Output, aliases: tuple | None) -> _Output:
+    if not aliases:
+        return columns
+    if len(aliases) > len(columns):
+        raise RestrictedColumnError("Source has fewer columns than its alias list")
+    return tuple(alias.sval for alias in aliases) + columns[len(aliases):]
 
 
-def _make_placeholder_target(placeholder: str, alias: str):
-    """Create a ResTarget with a literal placeholder value."""
-    # Parse a simple SELECT <placeholder> AS <alias> and extract the target
-    safe_alias = alias.replace('"', "").replace("'", "").replace(";", "")[:63]
-    try:
-        mini = parse_sql(f'SELECT {placeholder} AS "{safe_alias}"')
-        return mini[0].stmt.targetList[0]
-    except Exception:
-        # Fallback: bare string placeholder
-        mini = parse_sql(f"SELECT '[REDACTED]' AS \"{safe_alias}\"")
-        return mini[0].stmt.targetList[0]
+def _output_name(target: ast.ResTarget) -> str | None:
+    if target.name is not None:
+        return target.name
+    value = target.val
+    if isinstance(value, ast.ColumnRef):
+        return value.fields[-1].sval
+    if isinstance(value, ast.FuncCall):
+        return value.funcname[-1].sval
+    if isinstance(value, ast.A_Expr):
+        return "nullif" if value.kind == A_Expr_Kind.AEXPR_NULLIF else "?column?"
+    if isinstance(value, ast.A_Const):
+        return "?column?"
+    return None
 
 
-def _make_column_target(alias: str, column: str):
-    """Create a ResTarget for alias.column."""
-    safe_alias = alias.replace('"', "")[:63]
-    safe_col = column.replace('"', "")[:63]
-    mini = parse_sql(f'SELECT "{safe_alias}"."{safe_col}"')
-    return mini[0].stmt.targetList[0]
+def _identifiers(parts: tuple[str, ...]) -> tuple[ast.String, ...]:
+    return tuple(ast.String(sval=part) for part in parts)
+
+
+def _redacted_target(name: str) -> ast.ResTarget:
+    return ast.ResTarget(name=name, val=ast.A_Const(val=ast.String(sval="[REDACTED]")))
+
+
+def _validate_function(func_call: ast.FuncCall, allowlist: Allowlist) -> None:
+    parts = tuple(part.sval for part in func_call.funcname)
+    name = parts[-1].upper()
+    if name in ALWAYS_BLOCKED_FUNCTIONS:
+        raise DisallowedFunctionError(f"Function {name} is not allowed")
+    if len(parts) > 1 and parts[0].lower() in BLOCKED_SCHEMAS:
+        raise SystemCatalogError(f"Function in schema {parts[0]} is not allowed")
+    if not allowlist.is_function_allowed(name):
+        raise DisallowedFunctionError(f"Function {name} is not on the allowed list")
+    if func_call.agg_star and name != "COUNT":
+        raise DisallowedFunctionError(f"Star (*) in function arguments is not allowed: {name}(*)")
