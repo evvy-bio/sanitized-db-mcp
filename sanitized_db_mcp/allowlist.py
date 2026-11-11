@@ -21,6 +21,15 @@ class Allowlist:
         # tables: {table_name: {column_name: {type, placeholder}}}
         self._tables = tables
         self._allowed_functions = allowed_functions
+        database_tables: dict[tuple[str, str], set[str]] = {}
+        for table, columns in tables.items():
+            schema, separator, relation = table.partition(".")
+            if not separator:
+                schema, relation = "public", schema
+            database_tables.setdefault((schema, relation), set()).update(columns)
+        self._database_tables = {
+            table: tuple(sorted(columns)) for table, columns in database_tables.items()
+        }
 
     # ------------------------------------------------------------------
     # Loading
@@ -81,6 +90,18 @@ class Allowlist:
     def get_visible_columns(self, table: str) -> set[str]:
         """Return the set of visible column names for a table."""
         return set(self._tables.get(table.lower(), {}).keys())
+
+    def database_table_columns(self, schema: str, relation: str) -> tuple[str, ...] | None:
+        """Return exact column names, or None for an unapproved relation."""
+        return self._database_tables.get((schema, relation))
+
+    def database_columns(self) -> set[tuple[str, str, str]]:
+        """Return exact PostgreSQL names approved for SELECT access."""
+        return {
+            (schema, relation, column)
+            for (schema, relation), columns in self._database_tables.items()
+            for column in columns
+        }
 
     def is_function_allowed(self, func_name: str) -> bool:
         """Return True if the function is on the allowed list."""

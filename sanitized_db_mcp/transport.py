@@ -4,7 +4,7 @@ SSE transport for the sanitizing MCP server.
 Provides a Starlette ASGI application with:
   - GET /sse          SSE connection endpoint (MCP session)
   - POST /messages/   Client-to-server message endpoint
-  - GET /health       Health check for load balancers / Render
+  - GET /health       Database readiness check for load balancers / Render
 
 Requires the [sse] optional extra:
     pip install 'sanitized-db-mcp[sse]'
@@ -13,6 +13,7 @@ Requires the [sse] optional extra:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 import hmac
 import logging
 import time
@@ -20,6 +21,8 @@ import time
 from anyio import BrokenResourceError, ClosedResourceError
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+
+from .errors import ConfigurationError
 
 try:
     from starlette.applications import Starlette
@@ -115,16 +118,6 @@ class BearerAuthMiddleware:
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-
-async def health_check(request: Request) -> JSONResponse:
-    """Shallow health check for Render / load balancers."""
-    return JSONResponse({"status": "ok"})
-
-
-# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
@@ -132,6 +125,7 @@ async def health_check(request: Request) -> JSONResponse:
 def create_sse_app(
     server: Server,
     *,
+    check_database: Callable[[], None],
     api_key: str | None = None,
     session_timeout: int | None = None,
 ) -> Starlette | BearerAuthMiddleware:
@@ -141,6 +135,14 @@ def create_sse_app(
     """
     sse_transport = SseServerTransport("/messages/")
     init_options = server.create_initialization_options()
+
+    def health_check(_request: Request) -> JSONResponse:
+        try:
+            check_database()
+        except ConfigurationError as error:
+            error.log()
+            return JSONResponse({"status": "not_ready"}, status_code=503)
+        return JSONResponse({"status": "ok"})
 
     async def handle_sse(request: Request) -> Response:
         # _send is a private attr on starlette Request; connect_sse needs
